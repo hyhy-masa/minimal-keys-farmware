@@ -24,7 +24,7 @@ manifest:
     - name: zmk-module-ble-management
       remote: hyhy-masa
       revision: 851661cd
-- name: zmk-module-battery-history
+    - name: zmk-module-battery-history
       remote: hyhy-masa
       revision: 465e53e9
     - name: zmk-module-settings-rpc
