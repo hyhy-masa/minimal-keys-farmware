@@ -39,6 +39,7 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           raw="${INPUT_TAG:-$RELEASE_TAG}"
@@ -55,7 +56,12 @@ jobs:
             exit 1
           fi
 
-          curl -sSfL "https://api.github.com/repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+          # API は必ず認証して叩く。ランナーの外向きIPは他の全ユーザーと共有で、
+          # 認証なしだと時間あたりの枠を食い合って 403 になる（公開リポでも同じ）。
+          curl -sSfL \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             -o releases.json
           echo "このリポジトリにあるリリース:"
           jq -r '.[] | "  - \(.tag_name)"' releases.json
@@ -82,14 +88,17 @@ jobs:
       - name: ファームウェアを取得する
         env:
           TAG: ${{ steps.target.outputs.tag }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           mkdir fw && cd fw
 
-          # 公開リポジトリなので、取得に認証は要らない。
           # gh に頼ると失敗理由が「release not found」の一言に潰れるため、
           # 何が付いているかを自分で列挙してから落とす。
-          curl -sSfL "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+          curl -sSfL \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
             -o release.json
 
           echo "リリース $TAG に付いているファイル:"
