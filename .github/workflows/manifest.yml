@@ -34,38 +34,82 @@ jobs:
   build-manifest:
     runs-on: ubuntu-latest
     steps:
-      - name: 対象のタグを決める
+      - name: 対象のリリースを特定する
         id: target
         env:
           INPUT_TAG: ${{ inputs.tag }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
         run: |
           set -euo pipefail
-          tag="${INPUT_TAG:-$RELEASE_TAG}"
+          raw="${INPUT_TAG:-$RELEASE_TAG}"
+
+          # 貼り付けで前後に空白や改行が混ざると「見つからない」で落ちる。
+          # 落ちること自体より、何を探したのかがログに出ないほうが問題なので、
+          # 受け取った値と照合に使う値の両方を必ず表示する。
+          tag="$(printf '%s' "$raw" | tr -d '[:space:]')"
+          echo "受け取った値: '$raw'"
+          echo "照合に使う値: '$tag'"
+
           if [ -z "$tag" ]; then
-            echo "::error::対象のタグを決められませんでした。"
+            echo "::error::対象のタグが空です。"
             exit 1
           fi
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          curl -sSfL "https://api.github.com/repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            -o releases.json
+          echo "このリポジトリにあるリリース:"
+          jq -r '.[] | "  - \(.tag_name)"' releases.json
+
+          # v の有無だけの取り違えは自動で吸収する。それ以外は直さない
+          # （似ているだけの別リリースを掴むほうが危険）。
+          resolved=""
+          for cand in "$tag" "v$tag" "${tag#v}"; do
+            [ -n "$cand" ] || continue
+            if jq -e --arg t "$cand" 'any(.[]; .tag_name == $t)' releases.json > /dev/null; then
+              resolved="$cand"
+              break
+            fi
+          done
+
+          if [ -z "$resolved" ]; then
+            echo "::error::'$tag' に一致するリリースがありません。上の一覧から正確なタグ名を選んで、もう一度実行してください。"
+            exit 1
+          fi
+
+          echo "対象リリース: $resolved"
+          echo "tag=$resolved" >> "$GITHUB_OUTPUT"
 
       - name: ファームウェアを取得する
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.target.outputs.tag }}
         run: |
           set -euo pipefail
           mkdir fw && cd fw
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern '*.uf2'
-          count=$(find . -maxdepth 1 -name '*.uf2' | wc -l | tr -d ' ')
+
+          # 公開リポジトリなので、取得に認証は要らない。
+          # gh に頼ると失敗理由が「release not found」の一言に潰れるため、
+          # 何が付いているかを自分で列挙してから落とす。
+          curl -sSfL "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+            -o release.json
+
+          echo "リリース $TAG に付いているファイル:"
+          jq -r '.assets[] | "  - \(.name) (\(.size) bytes)"' release.json
+
+          jq -r '.assets[] | select(.name | endswith(".uf2")) | .browser_download_url' \
+            release.json > urls.txt
+          count=$(wc -l < urls.txt | tr -d ' ')
           if [ "$count" -eq 0 ]; then
-            echo "::error::リリース $TAG に .uf2 が1つもありません。ファームウェアを先にアップロードしてから、このワークフローを手動で再実行してください。"
+            echo "::error::リリース $TAG に .uf2 が1つもありません。ファームウェアを先にアップロードしてから、もう一度実行してください。"
             exit 1
           fi
+
+          while read -r url; do
+            curl -sSfL -O "$url"
+          done < urls.txt
           ls -l
 
       - name: manifest.json を組み立てる
         env:
-          GH_TOKEN: ${{ github.token }}
           TAG: ${{ steps.target.outputs.tag }}
         run: |
           set -euo pipefail
@@ -74,13 +118,14 @@ jobs:
           # 設定の初期化が要るかは、リリースノートの印で決める。
           # 推測しない（誤って true にすると顧客の設定が消える）。
           #
-          # ノートは API から取る。手動実行のときは github.event.release が空で、
-          # そこを見ると印を取りこぼして黙って false になるため。
+          # ノートは前段で取得済みの release.json から読む。手動実行のときは
+          # github.event.release が空で、そこを見ると印を取りこぼして黙って
+          # false になるため。
           reset_flag=false
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body \
-             | grep -qF '[requires-settings-reset]'; then
+          if jq -r '.body // ""' release.json | grep -qF '[requires-settings-reset]'; then
             reset_flag=true
           fi
+          echo "設定の初期化が必要: $reset_flag"
 
           base="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}"
           : > assets.jsonl
@@ -167,7 +212,13 @@ jobs:
           TAG: ${{ steps.target.outputs.tag }}
         run: |
           set -euo pipefail
-          gh release upload "$TAG" manifest.json --repo "$GITHUB_REPOSITORY" --clobber
+          # ここだけは書き込みなので token が要る。失敗する場合はリポジトリの
+          # Settings → Actions → General → Workflow permissions が
+          # 「Read and write permissions」になっているか確認する。
+          if ! gh release upload "$TAG" manifest.json --repo "$GITHUB_REPOSITORY" --clobber; then
+            echo "::error::manifest.json を添付できませんでした。Settings → Actions → General → Workflow permissions を「Read and write permissions」にしてから、もう一度実行してください。"
+            exit 1
+          fi
 
       - name: 顧客が受け取るものを実際に取得して確認する
         env:
